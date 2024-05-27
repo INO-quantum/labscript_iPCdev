@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 23/4/2024 by Andi
+# last change 27/5/2024 by Andi
 
 # TODO: when needed implement split_connection, combine_channel_data, extract_channel_data and generate_code for your device.
 

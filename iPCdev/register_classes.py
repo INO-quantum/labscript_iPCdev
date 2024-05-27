@@ -1,3 +1,7 @@
+# internal pseudoclock device
+# created April 2024 by Andi
+# last change 27/5/2024 by Andi
+
 from labscript_devices import register_classes
 
 blacs_path     = 'user_devices.iPCdev.blacs_tabs.iPCdev_tab'

@@ -1,3 +1,7 @@
+# internal pseudoclock device
+# created April 2024 by Andi
+# last change 27/5/2024 by Andi
+
 import numpy as np
 import labscript_utils.h5_lock
 import h5py
@@ -23,11 +27,21 @@ from user_devices.iPCdev.labscript_devices import (
 ARG_SIM = 'simulate'
 
 # default update time interval in seconds when status monitor shows actual status
-UPDATE_TIME = 1.0
+UPDATE_TIME                     = 1.0
 
-# event ID's in steps of 2
-EVENT_TRANSITION_TO_BUFFERED    = 2
-EVENT_TRANSITION_TO_MANUAL      = 4
+# default timeout in seconds for sync_boards
+SYNC_TIMEOUT                    = 1.0
+
+# events
+EVENT_TO_PRIMARY                = '%s_to_prim'
+EVENT_FROM_PRIMARY              = '%s_from_prim'
+EVENT_TIMEOUT                   = 'timeout!'
+EVENT_COUNT_INITIAL             = 0
+
+# return code from sync_boards
+SYNC_RESULT_OK                  = 0     # ok
+SYNC_RESULT_TIMEOUT             = 1     # connection timeout
+SYNC_RESULT_TIMEOUT_OTHER       = 2     # timeout on another board
 
 class iPCdev_worker(Worker):
     def init(self):
@@ -66,56 +80,121 @@ class iPCdev_worker(Worker):
         # file id used to determine if file has changed or not
         self.file_id = None
 
-        # experiment time in seconds and number of samples for different channels
+        # experiment time in seconds and number of channels for different output types
         self.exp_time = 0
-        self.num_samples = {}
+        self.num_channels = {}
 
         # prepare zprocess events for communication between primary and secondary boards
         # primary board: boards/events = list of all secondary board names/events
         # secondary board: boards/events = list containing only primary board name/event
-        if self.is_primary:
-            self.events = [self.process_tree.event('%s_evt'%s, role='both') for s in self.boards]
-        else:
-            self.events = [self.process_tree.event('%s_evt' % self.device_name, role='both')]
+        self.create_events()
 
-    def sync_boards(self, id, payload=None):
+        if False:
+            # test events
+            # sometimes after fresh start the events timeout without obvious reason!
+            # here we test synchronization and if there is a timeout we re-create events.
+            for i,event in enumerate(self.events):
+                (timeout, result) = self.sync_boards(EVENT_STARTUP, payload=self.device_name)
+                if timeout:
+                    print('%s: sync test timeout! recreate events ...' % (self.device_name))
+                else:
+                    if self.is_primary:
+                        boards = [self.device_name] + self.boards
+                        for i, (board, name) in enumerate(result.items()):
+                            if board != boards[i]:
+                                raise LabscriptError("%s board %s expected but got %s!" % (self.device_name, boards[i], board))
+                            elif board != name:
+                                raise LabscriptError("%s board %s expected but got %s!" % (self.device_name, board, name))
+                    else:
+                        for board, name in result.items():
+                            if board != name:
+                                raise LabscriptError("%s board %s expected but got %s!" % (self.device_name, board, name))
+                    print('%s: sync test result:' % (self.device_name), result)
+
+    def create_events(self):
+        if self.is_primary:
+            self.events_wait = [self.process_tree.event(EVENT_TO_PRIMARY % self.device_name, role='wait')]
+            self.events_post = [self.process_tree.event(EVENT_FROM_PRIMARY % s, role='post') for s in self.boards]
+        else:
+            self.events_post = [self.process_tree.event(EVENT_TO_PRIMARY % self.boards[0], role='post')]
+            self.events_wait = [self.process_tree.event(EVENT_FROM_PRIMARY % self.device_name, role='wait')]
+        self.event_count = EVENT_COUNT_INITIAL
+
+    def sync_boards(self, payload=None, timeout=SYNC_TIMEOUT, reset_event_counter=False):
         # synchronize multiple boards
-        # give unique event id in steps of 2 for each type of event.
+        # payload = data to be distributed to all boards.
+        # timeout = timeout in seconds
+        # reset_event_counter = if True resets event counter before waiting.
         # 1. primary board waits for events of all secondary boards and then sends event back.
         # 2. each secondary board sends event to primary board and waits for primary event.
         # primary collects dictionary {board_name:payload} for all boards and sends back to all boards.
         # this allows to share data among boards.
-        # returns (timeout=True/False, dictionary of payloads or empty if None received)
-        # this function acts like a "barrier" for all workers:
-        # i.e. function exits only when all boards have entered it.
-        timeout = False
+        # returns (status, result, duration)
+        # status   = SYNC_RESULT_OK if all ok
+        #            SYNC_RESULT_TIMEOUT if connection timeout
+        #            SYNC_RESULT_TIMEOUT_OTHER if connection to any other board timeout
+        # result   = if not None dictionary with key = board name, value = payload
+        # duration = total time in ms the worker spent in sync_boards function
+        t_start = get_ticks()
+        if reset_event_counter: self.event_count = EVENT_COUNT_INITIAL
+        sync_result = SYNC_RESULT_OK
         if self.is_primary:
             # 1. primary board: first wait then send
-            payload = {} if payload is None else {self.device_name:payload}
-            for i,event in enumerate(self.events):
+            result = {} if payload is None else {self.device_name:payload}
+            event = self.events_wait[0]
+            #sleep(0.1)
+            for i in range(len(self.boards)):
+                is_timeout = False
                 try:
-                    t_start = get_ticks()
-                    result = event.wait(id, timeout=1.0)
-                    if result is not None: payload[self.boards[i]] = result
-                    #print("run %i event %i board '%s' result '%s' (%.3fms wait time)" % (self.run_count, id, self.boards[i], str(result), (get_ticks() - t_start)*1e3))
+                    _t_start = get_ticks()
+                    _result = event.wait(self.event_count, timeout=timeout/len(self.boards))
+                    #if _result is not None: result[self.boards[i]] = _result
+                    if _result is not None: result.update(_result)
                 except zTimeoutError:
-                    timeout = True
-            for event in self.events:
-                event.post(id + 1, data=None if len(payload) == 0 else payload)
-            # return collected payload from boards
-            result = payload
+                    is_timeout = True
+                    sync_result = SYNC_RESULT_TIMEOUT
+                    result[self.boards[i]] = EVENT_TIMEOUT
+                #print("%s sync_boards '%s' (%.3fms, id=%i): %s %s" % (self.device_name, self.boards[i],
+                #print("%s sync_boards (%i) (%.3fms, id=%i): %s %s" % (self.device_name, i,
+                #                                                  (get_ticks() - _t_start) * 1e3, self.event_count,
+                #                                                  'timeout!' if is_timeout else str(_result),
+                #                                                  '(other timeout)' if sync_result == SYNC_RESULT_TIMEOUT_OTHER else ''))
+            if sync_result == SYNC_RESULT_OK:
+                for event in self.events_post:
+                    event.post(self.event_count, data=None if len(result) == 0 else result)
+            else:
+                # on timeout we have to ensure that primary board waits total timeout time.
+                # this is needed since would start waiting too early after reset if one board timeout reset and other not.
+                remaining = timeout - (get_ticks() - t_start)
+                if remaining > 0:
+                    #print("%s wait additional %.3f ms" % (self.device_name, remaining))
+                    sleep(remaining)
+            # return total duration in ms
+            duration = (get_ticks() - t_start) * 1e3
         else:
             # 2. secondary board: first send then wait
-            self.events[0].post(id, data=payload)
+            #sleep(0.1)
+            self.events_post[0].post(self.event_count, data={self.device_name:payload})
+            is_timeout = False
             try:
-                t_start = get_ticks()
-                result = self.events[0].wait(id + 1, timeout=1.0)
-                #print("run %i event %i board '%s' result '%s' (%.3fms wait time)" % (self.run_count, id, self.boards[0], str(result), (get_ticks() - t_start) * 1e3))
+                result = self.events_wait[0].wait(self.event_count, timeout=timeout)
+                if (result is not None) and (sync_result == SYNC_RESULT_OK):
+                    for board, _result in result.items():
+                        if isinstance(_result, str) and _result == EVENT_TIMEOUT:
+                            sync_result = SYNC_RESULT_TIMEOUT_OTHER
+                            break
             except zTimeoutError:
-                timeout = True
+                is_timeout = True
+                sync_result = SYNC_RESULT_TIMEOUT
                 result = None
+            duration = (get_ticks() - t_start) * 1e3
+            #print("%s sync_boards '%s' (%.3fms, id=%i): %s %s" % (self.device_name, self.boards[0],
+            #                                                  duration, self.event_count,
+            #                                                  'timeout!' if is_timeout else str(result),
+            #                                                  '(other timeout)' if sync_result == SYNC_RESULT_TIMEOUT_OTHER else ''))
+        self.event_count += 1
 
-        return (timeout, result)
+        return (sync_result, result, duration)
 
     def program_manual(self, front_panel_values):
         print(self.device_name, 'program manual')
@@ -135,7 +214,7 @@ class iPCdev_worker(Worker):
                 # new file
                 self.file_id = id
                 self.exp_time = 0
-                self.num_samples = {}
+                self.num_channels = {}
                 update = True
 
                 # load data tables for all output channels
@@ -145,44 +224,24 @@ class iPCdev_worker(Worker):
                     times = group[DEVICE_TIME][()]
                     static = False
                     if hardware_type == HARDWARE_TYPE_AO:
-                        devices = [(device.name, DEVICE_DATA_AO % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port)]
-                        try:
-                            self.num_samples['AO'] += len(times)
-                        except KeyError:
-                            self.num_samples['AO'] = len(times)
+                        devices = [(device.name, DEVICE_DATA_AO % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port, 'AO')]
                     elif hardware_type == HARDWARE_TYPE_STATIC_AO:
-                        devices = [(device.name, DEVICE_DATA_AO % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port)]
-                        try:
-                            self.num_samples['AO (static)'] += 1
-                        except KeyError:
-                            self.num_samples['AO (static)'] = 1
+                        devices = [(device.name, DEVICE_DATA_AO % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port, None)]
                         static = True
                     elif (hardware_type == HARDWARE_TYPE_DO):
-                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port)]
-                        try:
-                            self.num_samples['DO'] += len(times)
-                        except KeyError:
-                            self.num_samples['DO'] = len(times)
+                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, 'DO')]
                     elif (hardware_type == HARDWARE_TYPE_STATIC_DO):
-                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port)]
-                        try:
-                            self.num_samples['DO (static)'] += 1
-                        except KeyError:
-                            self.num_samples['DO (static)'] = 1
+                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, None)]
                         static = True
                     elif (hardware_type == HARDWARE_TYPE_TRG):
-                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port)]
+                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, None)]
                     elif hardware_type == HARDWARE_TYPE_DDS:
-                        devices = [(channel.name, DEVICE_DATA_DDS % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS], channel.parent_port), channel.parent_port) for channel in device.child_list.values()]
-                        try:
-                            self.num_samples['DDS'] += len(times)
-                        except KeyError:
-                            self.num_samples['DDS'] = len(times)
+                        devices = [(channel.name, DEVICE_DATA_DDS % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS], channel.parent_port), channel.parent_port, None) for channel in device.child_list.values()]
                     else:
                         print("warning: device %s unknown type %s (skip)" % (device.name, hardware_type))
                         continue
                     final = {}
-                    for (name, dataset, port) in devices:
+                    for (name, dataset, port, type) in devices:
                         data = group[dataset][()]
                         if data is None:
                             raise LabscriptError("device %s: dataset %s not existing!" % (name, dataset))
@@ -193,6 +252,15 @@ class iPCdev_worker(Worker):
                         if times[-1] > self.exp_time: self.exp_time = times[-1]
                         channel_data = self.device_class_object.extract_channel_data(device.hardware_info, data)
                         final[port] = channel_data[-1]
+                        # save number of used channels per type of port.
+                        if (type is not None) and (len(channel_data) > 2):
+                            changes = ((channel_data[1:].astype(int) - channel_data[:-1].astype(int)) != 0)
+                            if np.any(changes):
+                                try:
+                                    self.num_channels[type] += 1
+                                except KeyError:
+                                    self.num_channels[type] = 1
+
                     if len(devices) == 1: final_values[connection] = final[device.parent_port]
                     else:                 final_values[connection] = final
 
@@ -207,17 +275,18 @@ class iPCdev_worker(Worker):
         if True:
             # synchronize boards and get experiment time for all of them
             # note: this is for demonstration and could be commented.
-            (timeout, board_times) = self.sync_boards(id=EVENT_TRANSITION_TO_BUFFERED, payload=self.exp_time)
+            (timeout, board_times, duration) = self.sync_boards(id=EVENT_TRANSITION_TO_BUFFERED, payload=self.exp_time)
             if timeout:
                 print("\ntimeout sync with all boards!\n")
                 return None
             print('board times:', board_times)
 
-            # we set experiment time to largest of all boards
-            for board, exp_time in board_times.items():
-                if exp_time > self.exp_time:
-                    print('%s update duration from board %s to %.3e s' % (self.device_name, board,exp_time))
-                    self.exp_time = exp_time
+            if True:
+                # we set experiment time to largest of all boards
+                for board, exp_time in board_times.items():
+                    if exp_time > self.exp_time:
+                        print('%s update duration from board %s to %.3e s' % (self.device_name, board,exp_time))
+                        self.exp_time = exp_time
 
         # manually call start_run from here
         self.start_run()
@@ -236,15 +305,16 @@ class iPCdev_worker(Worker):
         else:
             # get number of samples
             tmp = []
-            for name, samples in self.num_samples.items():
-                tmp += ['%s: %i samples' % (name, samples)]
-            print("%s done %s (ok)" % (self.device_name, ','.join(tmp)))
+            for name, samples in self.num_channels.items():
+                tmp += ['%s: %i' % (name, samples)]
+            if len(tmp) > 0: print("%s done, active channels: %s (ok)" % (self.device_name, ', '.join(tmp)))
+            else:            print("%s done, no active channels (ok)" % (self.device_name))
 
             # get status (error) of all boards
             (timeout, self.board_status) = self.sync_boards(EVENT_TRANSITION_TO_MANUAL, payload=error)
             if timeout:
                 print("\ntimeout get status of all boards!\n")
-                return None
+                return True
             print('board status:', self.board_status)
 
         # return True = all ok

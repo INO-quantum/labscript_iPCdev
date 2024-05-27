@@ -1,3 +1,7 @@
+# internal pseudoclock device
+# created April 2024 by Andi
+# last change 27/5/2024 by Andi
+
 import labscript_utils.h5_lock
 import h5py
 import numpy as np
@@ -478,7 +482,7 @@ class iPCdev_tab(DeviceTab):
         # optionally return empty dict when transition_to_manual is called with abort=True.
         # TODO: save result into h5 file either here or in primary worker.
         board_status = yield(self.queue_work(self.primary_worker, 'status_monitor', True))
-        print(self.device_name, 'status end result', board_status)
+        #print(self.device_name, 'status end result', board_status)
 
     def get_save_data(self):
         "return all GUI settings to be retrieved after BLACS restarts"

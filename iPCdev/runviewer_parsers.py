@@ -1,3 +1,7 @@
+# internal pseudoclock device
+# created April 2024 by Andi
+# last change 27/5/2024 by Andi
+
 import labscript_utils.h5_lock
 import h5py
 import numpy as np
@@ -13,9 +17,6 @@ from user_devices.iPCdev.labscript_devices import (
     HARDWARE_TYPE_AO, HARDWARE_TYPE_STATIC_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_STATIC_DO, HARDWARE_TYPE_TRG, HARDWARE_TYPE_DDS
 )
 
-# test
-from user_devices.h5_file_parser import read_file, read_group
-
 class iPCdev_parser(object):
     # show all devices (True) or only devices with data (False)
     SHOW_ALL = True
@@ -27,10 +28,6 @@ class iPCdev_parser(object):
         self.device = device
         if iPCdev_parser.SHOW_ALL: print("runviewer loading class '%s' device '%s' (display all channels)"       % (device.device_class, device.name))
         else:                      print("runviewer loading class '%s' device '%s' (display only used channels)" % (device.device_class, device.name))
-
-        if False:
-            # for debugging read content of file
-            read_file(self.path)
 
         # below we call static method extract_channel_data in a possibly derived class of iPCdev
         # dynamically load module and get the class object
