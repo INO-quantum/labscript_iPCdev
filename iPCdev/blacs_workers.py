@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 27/5/2024 by Andi
+# last change 28/5/2024 by Andi
 
 import numpy as np
 import labscript_utils.h5_lock
@@ -51,6 +51,7 @@ class iPCdev_worker(Worker):
 
         # reduce number of log entries in logfile (labscript-suite/logs/BLACS.log)
         self.logger.setLevel(log_level)
+        #self.logger.setLevel(logging.INFO)
 
         self.worker_args = self.properties['worker_args']
         if ARG_SIM in self.worker_args:
@@ -118,12 +119,14 @@ class iPCdev_worker(Worker):
         else:
             self.events_post = [self.process_tree.event(EVENT_TO_PRIMARY % self.boards[0], role='post')]
             self.events_wait = [self.process_tree.event(EVENT_FROM_PRIMARY % self.device_name, role='wait')]
-        self.event_count = EVENT_COUNT_INITIAL
+        # TODO: if initial count is zero get rarely timeout at start restart of tab
+        #       adding an offset at restart MIGHT solve this issue but since it happens very rare I am not sure yet?
+        self.event_count = EVENT_COUNT_INITIAL + 10
 
     def sync_boards(self, payload=None, timeout=SYNC_TIMEOUT, reset_event_counter=False):
         # synchronize multiple boards
         # payload = data to be distributed to all boards.
-        # timeout = timeout in seconds
+        # timeout = timeout time in seconds
         # reset_event_counter = if True resets event counter before waiting.
         # 1. primary board waits for events of all secondary boards and then sends event back.
         # 2. each secondary board sends event to primary board and waits for primary event.
@@ -135,6 +138,14 @@ class iPCdev_worker(Worker):
         #            SYNC_RESULT_TIMEOUT_OTHER if connection to any other board timeout
         # result   = if not None dictionary with key = board name, value = payload
         # duration = total time in ms the worker spent in sync_boards function
+        # timeout behaviour:
+        # since each board can be reset by user self.event_count might get out of sync with other boards.
+        # this will cause timeout on all boards even on the ones which are not out of sync!
+        # on timeout each board can call sync_boards again with reset_event_counter=True
+        # this allows to re-synchronize all boards and continue without restarting of blacs.
+        # TODO: in very rare circumstances this does not work and blacs goes into pause mode.
+        #       usually, just pressing the pause button starts the cycle again without errors.
+        #       I have maybe found a solution but its hard to debug. so I am not sure it is fixed or not.
         t_start = get_ticks()
         if reset_event_counter: self.event_count = EVENT_COUNT_INITIAL
         sync_result = SYNC_RESULT_OK
@@ -147,27 +158,23 @@ class iPCdev_worker(Worker):
                 is_timeout = False
                 try:
                     _t_start = get_ticks()
+                    #self.logger.log(logging.INFO, "%s (pri) wait evt %i (#%i) ..." % (self.device_name, self.event_count, i))
                     _result = event.wait(self.event_count, timeout=timeout/len(self.boards))
-                    #if _result is not None: result[self.boards[i]] = _result
                     if _result is not None: result.update(_result)
                 except zTimeoutError:
                     is_timeout = True
                     sync_result = SYNC_RESULT_TIMEOUT
                     result[self.boards[i]] = EVENT_TIMEOUT
-                #print("%s sync_boards '%s' (%.3fms, id=%i): %s %s" % (self.device_name, self.boards[i],
-                #print("%s sync_boards (%i) (%.3fms, id=%i): %s %s" % (self.device_name, i,
-                #                                                  (get_ticks() - _t_start) * 1e3, self.event_count,
-                #                                                  'timeout!' if is_timeout else str(_result),
-                #                                                  '(other timeout)' if sync_result == SYNC_RESULT_TIMEOUT_OTHER else ''))
+                #self.logger.log(logging.WARNING if is_timeout else logging.INFO, "%s (pri) wait evt %i (#%i) %.3fms: %s" % (self.device_name, self.event_count, i, (get_ticks() - _t_start) * 1e3, 'timeout!' if is_timeout else str(_result)))
             if sync_result == SYNC_RESULT_OK:
                 for event in self.events_post:
                     event.post(self.event_count, data=None if len(result) == 0 else result)
             else:
-                # on timeout we have to ensure that primary board waits total timeout time.
-                # this is needed since would start waiting too early after reset if one board timeout reset and other not.
+                # on timeout we have to ensure that primary board waits the same time as secondary boards,
+                # otherwise primary board resets and starts waiting too early while other boards are still waiting for first event.
                 remaining = timeout - (get_ticks() - t_start)
                 if remaining > 0:
-                    #print("%s wait additional %.3f ms" % (self.device_name, remaining))
+                    #self.logger.log(logging.INFO,"%s (pri) wait remaining %.3fms ..." % (self.device_name, remaining * 1e3))
                     sleep(remaining)
             # return total duration in ms
             duration = (get_ticks() - t_start) * 1e3
@@ -177,6 +184,7 @@ class iPCdev_worker(Worker):
             self.events_post[0].post(self.event_count, data={self.device_name:payload})
             is_timeout = False
             try:
+                #self.logger.log(logging.INFO, "%s (sec) wait evt %i ..." % (self.device_name, self.event_count))
                 result = self.events_wait[0].wait(self.event_count, timeout=timeout)
                 if (result is not None) and (sync_result == SYNC_RESULT_OK):
                     for board, _result in result.items():
@@ -188,10 +196,7 @@ class iPCdev_worker(Worker):
                 sync_result = SYNC_RESULT_TIMEOUT
                 result = None
             duration = (get_ticks() - t_start) * 1e3
-            #print("%s sync_boards '%s' (%.3fms, id=%i): %s %s" % (self.device_name, self.boards[0],
-            #                                                  duration, self.event_count,
-            #                                                  'timeout!' if is_timeout else str(result),
-            #                                                  '(other timeout)' if sync_result == SYNC_RESULT_TIMEOUT_OTHER else ''))
+            #self.logger.log(logging.WARNING if is_timeout else logging.INFO, "%s (sec) wait evt %i %.3fms: %s" % (self.device_name, self.event_count, duration, 'timeout!' if is_timeout else 'ok'))
         self.event_count += 1
 
         return (sync_result, result, duration)
