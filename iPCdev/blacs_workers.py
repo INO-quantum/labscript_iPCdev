@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 28/5/2024 by Andi
+# last change 29/5/2024 by Andi
 
 import numpy as np
 import labscript_utils.h5_lock
@@ -12,7 +12,6 @@ from labscript import LabscriptError
 from labscript_utils import import_or_reload
 from blacs.tab_base_classes import Worker
 
-from time import sleep
 import logging
 from user_devices.iPCdev.labscript_devices import (
     log_level,
@@ -20,6 +19,9 @@ from user_devices.iPCdev.labscript_devices import (
     DEVICE_DATA_AO, DEVICE_DATA_DO, DEVICE_DATA_DDS,
     HARDWARE_TYPE_AO, HARDWARE_TYPE_STATIC_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_STATIC_DO, HARDWARE_TYPE_TRG, HARDWARE_TYPE_DDS,
 )
+
+from time import sleep
+
 # for testing
 #from user_devices.h5_file_parser import read_group
 
@@ -31,6 +33,9 @@ UPDATE_TIME                     = 1.0
 
 # default timeout in seconds for sync_boards
 SYNC_TIMEOUT                    = 1.0
+
+# time margin for sync_boards with reset_event_counter=True
+SYNC_TIME_MARGIN                = 0.2
 
 # events
 EVENT_TO_PRIMARY                = '%s_to_prim'
@@ -121,7 +126,7 @@ class iPCdev_worker(Worker):
             self.events_wait = [self.process_tree.event(EVENT_FROM_PRIMARY % self.device_name, role='wait')]
         # TODO: if initial count is zero get rarely timeout at start restart of tab
         #       adding an offset at restart MIGHT solve this issue but since it happens very rare I am not sure yet?
-        self.event_count = EVENT_COUNT_INITIAL + 10
+        self.event_count = EVENT_COUNT_INITIAL
 
     def sync_boards(self, payload=None, timeout=SYNC_TIMEOUT, reset_event_counter=False):
         # synchronize multiple boards
@@ -140,20 +145,27 @@ class iPCdev_worker(Worker):
         # duration = total time in ms the worker spent in sync_boards function
         # timeout behaviour:
         # since each board can be reset by user self.event_count might get out of sync with other boards.
-        # this will cause timeout on all boards even on the ones which are not out of sync!
-        # on timeout each board can call sync_boards again with reset_event_counter=True
+        # this will cause timeout on all boards - event the ones which are still synchronized!
+        # this is by purpose to ensure all boards have the same waiting times.
+        # on timeout each worker should call sync_boards again with reset_event_counter=True
         # this allows to re-synchronize all boards and continue without restarting of blacs.
-        # TODO: in very rare circumstances this does not work and blacs goes into pause mode.
-        #       usually, just pressing the pause button starts the cycle again without errors.
-        #       I have maybe found a solution but its hard to debug. so I am not sure it is fixed or not.
+        # note: in rare cases this was not working since the primary can by chance still wait for timeout,
+        #       while any secondary is already timeout and calls sync_boards again but with reset self.event_count.
+        #       in this case the primary might discard the new event since it still waits for the old event.
+        #       when it then resets it will timeout because the new event was already discarded.
+        #       to avoid this issue on reset_event_counter the secondary boards wait SYNC_TIME_MARGIN time
+        #       before sending the reset events and the primary should be reset and waiting for the new event.
         t_start = get_ticks()
         if reset_event_counter: self.event_count = EVENT_COUNT_INITIAL
         sync_result = SYNC_RESULT_OK
         if self.is_primary:
             # 1. primary board: first wait then send
+            if reset_event_counter:
+                # compensate the additional waiting time of secondary boards
+                timeout += SYNC_TIME_MARGIN
             result = {} if payload is None else {self.device_name:payload}
             event = self.events_wait[0]
-            #sleep(0.1)
+            #sleep(0.1) # this triggers 100% the timeout event! when restarting both secondary boards!
             for i in range(len(self.boards)):
                 is_timeout = False
                 try:
@@ -180,7 +192,9 @@ class iPCdev_worker(Worker):
             duration = (get_ticks() - t_start) * 1e3
         else:
             # 2. secondary board: first send then wait
-            #sleep(0.1)
+            if reset_event_counter:
+                # ensure primary is reset before sending the reset event id
+                sleep(SYNC_TIME_MARGIN)
             self.events_post[0].post(self.event_count, data={self.device_name:payload})
             is_timeout = False
             try:
