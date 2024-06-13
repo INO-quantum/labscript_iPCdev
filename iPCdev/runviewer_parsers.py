@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 27/5/2024 by Andi
+# last change 13/6/2024 by Andi
 
 import labscript_utils.h5_lock
 import h5py
@@ -14,7 +14,9 @@ from user_devices.iPCdev.labscript_devices import (
     DEVICE_DEVICES, DEVICE_SEP,
     DEVICE_HARDWARE_INFO, DEVICE_INFO_PATH, DEVICE_INFO_ADDRESS, DEVICE_INFO_BOARD, DEVICE_INFO_CHANNEL, DEVICE_INFO_TYPE,
     DEVICE_TIME, DEVICE_DATA_AO, DEVICE_DATA_DO, DEVICE_DATA_DDS,
-    HARDWARE_TYPE_AO, HARDWARE_TYPE_STATIC_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_STATIC_DO, HARDWARE_TYPE_TRG, HARDWARE_TYPE_DDS
+    HARDWARE_TYPE, HARDWARE_SUBTYPE, HARDWARE_ADDRTYPE,
+    HARDWARE_TYPE_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_DDS,
+    HARDWARE_SUBTYPE_STATIC, HARDWARE_SUBTYPE_TRIGGER
 )
 
 class iPCdev_parser(object):
@@ -89,18 +91,18 @@ class iPCdev_parser(object):
                     clocklines.append(parent.name)
 
                 #print("device %s type %s" % (device.name, hardware_type))
-                if (hardware_type == HARDWARE_TYPE_AO):
-                    devices = [(device.name, DEVICE_DATA_AO % (device.name, address), False, False)]
-                elif (hardware_type == HARDWARE_TYPE_STATIC_AO):
-                    devices = [(device.name, DEVICE_DATA_AO % (device.name, address), True, False)]
-                elif (hardware_type == HARDWARE_TYPE_DO):
-                    devices = [(device.name, DEVICE_DATA_DO % (board, address), False, False)]
-                elif (hardware_type == HARDWARE_TYPE_STATIC_DO):
-                    devices = [(device.name, DEVICE_DATA_DO % (board, address), True, False)]
-                elif (hardware_type == HARDWARE_TYPE_TRG):
-                    devices = [(device.name, DEVICE_DATA_DO % (board, address), False, True)]
-                elif hardware_type == HARDWARE_TYPE_DDS:
-                    devices = [(channel.name, DEVICE_DATA_DDS % (device.name, address, channel.parent_port), False, False) for channel in device.child_list.values()]
+                if (hardware_type[HARDWARE_TYPE] == HARDWARE_TYPE_AO):
+                    static = hardware_type[HARDWARE_SUBTYPE] == HARDWARE_SUBTYPE_STATIC
+                    devices = [(device.name, DEVICE_DATA_AO % (device.name, address), static, False)]
+                elif (hardware_type[HARDWARE_TYPE] == HARDWARE_TYPE_DO):
+                    if hardware_type[HARDWARE_SUBTYPE] == HARDWARE_SUBTYPE_TRIGGER:
+                        devices = [(device.name, DEVICE_DATA_DO % (board, address), False, True)]
+                    else:
+                        static = hardware_type[HARDWARE_SUBTYPE] == HARDWARE_SUBTYPE_STATIC
+                        devices = [(device.name, DEVICE_DATA_DO % (board, address), False, False)]
+                elif hardware_type[HARDWARE_TYPE] == HARDWARE_TYPE_DDS:
+                    static = hardware_type[HARDWARE_SUBTYPE] == HARDWARE_SUBTYPE_STATIC
+                    devices = [(channel.name, DEVICE_DATA_DDS % (device.name, address, channel.parent_port), static, False) for channel in device.child_list.values()]
                 else:
                     print("warning: device %s unknown type %s (skip)" % (device.name, hardware_type))
                     continue

@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 29/5/2024 by Andi
+# last change 13/6/2024 by Andi
 
 import numpy as np
 import labscript_utils.h5_lock
@@ -13,12 +13,15 @@ from labscript_utils import import_or_reload
 from blacs.tab_base_classes import Worker
 
 import logging
-from user_devices.iPCdev.labscript_devices import (
+from .labscript_devices import (
     log_level,
-    DEVICE_INFO_PATH, DEVICE_TIME, DEVICE_INFO_ADDRESS, DEVICE_INFO_TYPE, DEVICE_INFO_BOARD,
+    DEVICE_INFO_PATH, DEVICE_TIME, DEVICE_HARDWARE_INFO, DEVICE_INFO_ADDRESS, DEVICE_INFO_TYPE, DEVICE_INFO_BOARD,
     DEVICE_DATA_AO, DEVICE_DATA_DO, DEVICE_DATA_DDS,
-    HARDWARE_TYPE_AO, HARDWARE_TYPE_STATIC_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_STATIC_DO, HARDWARE_TYPE_TRG, HARDWARE_TYPE_DDS,
+    HARDWARE_TYPE, HARDWARE_SUBTYPE,
+    HARDWARE_TYPE_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_DDS,
+    HARDWARE_SUBTYPE_STATIC, HARDWARE_SUBTYPE_TRIGGER,
 )
+from .blacs_tabs import DDS_CHANNEL_PROP_FREQ, DDS_CHANNEL_PROP_AMP, DDS_CHANNEL_PROP_PHASE
 
 from time import sleep
 
@@ -26,7 +29,8 @@ from time import sleep
 #from user_devices.h5_file_parser import read_group
 
 # optional worker_args
-ARG_SIM = 'simulate'
+ARG_SIM  = 'simulate'
+ARG_SYNC = 'sync_boards'
 
 # default update time interval in seconds when status monitor shows actual status
 UPDATE_TIME                     = 1.0
@@ -34,7 +38,11 @@ UPDATE_TIME                     = 1.0
 # default timeout in seconds for sync_boards
 SYNC_TIMEOUT                    = 1.0
 
+# reset sync counter each run. TODO: not fully tested.
+SYNC_RESET_EACH_RUN             = True
+
 # time margin for sync_boards with reset_event_counter=True
+# this is not used with SYNC_RESET_EACH_RUN
 SYNC_TIME_MARGIN                = 0.2
 
 # events
@@ -48,6 +56,9 @@ SYNC_RESULT_OK                  = 0     # ok
 SYNC_RESULT_TIMEOUT             = 1     # connection timeout
 SYNC_RESULT_TIMEOUT_OTHER       = 2     # timeout on another board
 
+# scale DDS channel analog values from hd5 file to displayed values of channels
+DDS_CHANNEL_SCALING = {DDS_CHANNEL_PROP_FREQ: 1e-6, DDS_CHANNEL_PROP_AMP: 1.0, DDS_CHANNEL_PROP_PHASE: 1.0}
+
 class iPCdev_worker(Worker):
     def init(self):
         global zTimeoutError; from zprocess.utils import TimeoutError as zTimeoutError
@@ -58,27 +69,50 @@ class iPCdev_worker(Worker):
         self.logger.setLevel(log_level)
         #self.logger.setLevel(logging.INFO)
 
+        # check worker arguments for options
+        options = []
         self.worker_args = self.properties['worker_args']
-        if ARG_SIM in self.worker_args:
-            self.simulate = self.worker_args[ARG_SIM]
-        else:
-            self.simulate = False
+        if self.worker_args is not None:
+            # simulate device
+            try:
+                self.simulate = self.worker_args[ARG_SIM]
+                if self.simulate: options.append('simulate')
+            except KeyError:
+                self.simulate = False
+            # synchronize boards
+            try:
+                self.sync = self.worker_args[ARG_SYNC]
+                if self.sync: options.append('synchronize boards')
+            except KeyError:
+                self.sync = False
+        if len(options) > 0: options = '(%s)'%(', '.join(options))
+        else:                options = ''
 
-        if self.simulate: print(self.device_name, 'init (simulate)\nworker args:', self.worker_args)
-        else:             print(self.device_name, 'init\nworker args:', self.worker_args)
+        if self.is_primary:
+            print(self.device_name, '(primary) init %s' % options)
+            print('%i secondary boards:' % (len(self.boards)), self.boards)
+        else:
+            print(self.device_name, '(secondary) init %s' % options)
+            print('primary board:', self.boards[0])
+
+        if False: # print worker args
+            print(self.device_name, 'worker args:', self.worker_args)
 
         # below we call static method extract_channel_data in a possibly derived class of iPCdev
-        # dynamically load module and get the class object
+        # dynamically load module and get the class object.
+        # TODO: not sure if this will work under all conditions? esp. importing modules in python is not robust.
         self.derived_module = self.properties['derived_module']
-        print('derived module:', self.derived_module)
-        print('device class:', self.device_class)
         device_module = import_or_reload(self.derived_module)
         self.device_class_object = getattr(device_module, self.device_class)
+        if False: # print module and class information
+            print('derived module:', self.derived_module)
+            print('device class:', self.device_class)
 
-        if self.shared_clocklines:
-            print('%i channels, %i clocklines (shared)' % (len(self.channels), len(self.clocklines)))
+        if self.properties['shared_clocklines']:
+            # when shared_clocklines = True then self.clocklines contains the clockline names of this board.
+            print('%s has %i channels, %i clocklines (shared)' % (self.device_name, len(self.channels), len(self.clocklines)))
         else:
-            print('%i channels' % (len(self.channels)))
+            print('%s has %i channels' % (self.device_name, len(self.channels)))
 
         if not hasattr(self, 'update_time'):
             self.update_time = UPDATE_TIME
@@ -95,28 +129,6 @@ class iPCdev_worker(Worker):
         # secondary board: boards/events = list containing only primary board name/event
         self.create_events()
 
-        if False:
-            # test events
-            # sometimes after fresh start the events timeout without obvious reason!
-            # here we test synchronization and if there is a timeout we re-create events.
-            for i,event in enumerate(self.events):
-                (timeout, result) = self.sync_boards(EVENT_STARTUP, payload=self.device_name)
-                if timeout:
-                    print('%s: sync test timeout! recreate events ...' % (self.device_name))
-                else:
-                    if self.is_primary:
-                        boards = [self.device_name] + self.boards
-                        for i, (board, name) in enumerate(result.items()):
-                            if board != boards[i]:
-                                raise LabscriptError("%s board %s expected but got %s!" % (self.device_name, boards[i], board))
-                            elif board != name:
-                                raise LabscriptError("%s board %s expected but got %s!" % (self.device_name, board, name))
-                    else:
-                        for board, name in result.items():
-                            if board != name:
-                                raise LabscriptError("%s board %s expected but got %s!" % (self.device_name, board, name))
-                    print('%s: sync test result:' % (self.device_name), result)
-
     def create_events(self):
         if self.is_primary:
             self.events_wait = [self.process_tree.event(EVENT_TO_PRIMARY % self.device_name, role='wait')]
@@ -124,8 +136,6 @@ class iPCdev_worker(Worker):
         else:
             self.events_post = [self.process_tree.event(EVENT_TO_PRIMARY % self.boards[0], role='post')]
             self.events_wait = [self.process_tree.event(EVENT_FROM_PRIMARY % self.device_name, role='wait')]
-        # TODO: if initial count is zero get rarely timeout at start restart of tab
-        #       adding an offset at restart MIGHT solve this issue but since it happens very rare I am not sure yet?
         self.event_count = EVENT_COUNT_INITIAL
 
     def sync_boards(self, payload=None, timeout=SYNC_TIMEOUT, reset_event_counter=False):
@@ -149,18 +159,23 @@ class iPCdev_worker(Worker):
         # this is by purpose to ensure all boards have the same waiting times.
         # on timeout each worker should call sync_boards again with reset_event_counter=True
         # this allows to re-synchronize all boards and continue without restarting of blacs.
-        # note: in rare cases this was not working since the primary can by chance still wait for timeout,
-        #       while any secondary is already timeout and calls sync_boards again but with reset self.event_count.
-        #       in this case the primary might discard the new event since it still waits for the old event.
-        #       when it then resets it will timeout because the new event was already discarded.
-        #       to avoid this issue on reset_event_counter the secondary boards wait SYNC_TIME_MARGIN time
-        #       before sending the reset events and the primary should be reset and waiting for the new event.
+        # notes:
+        # - in rare cases this was not working since the primary can by chance still wait for timeout,
+        #   while any secondary is already timeout and calls sync_boards again but with reset self.event_count.
+        #   in this case the primary might discard the new event since it still waits for the old event.
+        #   when it then resets it will timeout because the new event was already discarded.
+        #   to avoid this issue on reset_event_counter the secondary boards wait SYNC_TIME_MARGIN time
+        #   before sending the reset events and the primary should be reset and waiting for the new event.
+        # TODO:
+        # - test this option again: use reset_event_counter=True in each loop and set SYNC_TIME_MARGIN=0
+        #   this was essentially the first configuration I tested but due to further bugs was not working.
+        #   possibly this works now again and does not need the retry option.
         t_start = get_ticks()
         if reset_event_counter: self.event_count = EVENT_COUNT_INITIAL
         sync_result = SYNC_RESULT_OK
         if self.is_primary:
             # 1. primary board: first wait then send
-            if reset_event_counter:
+            if not SYNC_RESET_EACH_RUN and reset_event_counter:
                 # compensate the additional waiting time of secondary boards
                 timeout += SYNC_TIME_MARGIN
             result = {} if payload is None else {self.device_name:payload}
@@ -192,7 +207,7 @@ class iPCdev_worker(Worker):
             duration = (get_ticks() - t_start) * 1e3
         else:
             # 2. secondary board: first send then wait
-            if reset_event_counter:
+            if not SYNC_RESET_EACH_RUN and reset_event_counter:
                 # ensure primary is reset before sending the reset event id
                 sleep(SYNC_TIME_MARGIN)
             self.events_post[0].post(self.event_count, data={self.device_name:payload})
@@ -221,15 +236,16 @@ class iPCdev_worker(Worker):
 
     def transition_to_buffered(self, device_name, h5file, initial_values, fresh):
         # this is called for all iPCdev devices
+        # return None on error, dictionary of final values for each channel otherwise
         print(self.device_name, 'transition to buffered')
         #print('initial values:', initial_values)
         final_values = {}
-        update = False
+        update = fresh # requires supports_smart_programming=True and fresh=True when 'clear smart-programming cache' symbol clicked
 
         with h5py.File(h5file,'r') as f:
             # file id used to check if file has been changed
             id = f.attrs['sequence_id'] + ('_%i' % f.attrs['sequence_index']) + ('_%i' % f.attrs['run number'])
-            if self.file_id is None or self.file_id != id:
+            if update or (self.file_id is None) or (self.file_id != id):
                 # new file
                 self.file_id = id
                 self.exp_time = 0
@@ -238,29 +254,29 @@ class iPCdev_worker(Worker):
 
                 # load data tables for all output channels
                 for connection, device in self.channels.items():
-                    hardware_type = device.hardware_info[DEVICE_INFO_TYPE]
-                    group = f[device.hardware_info[DEVICE_INFO_PATH]]
+                    hardware_info    = device.properties[DEVICE_HARDWARE_INFO]
+                    hardware_type    = hardware_info[DEVICE_INFO_TYPE][HARDWARE_TYPE]
+                    hardware_subtype = hardware_info[DEVICE_INFO_TYPE][HARDWARE_SUBTYPE]
+                    group = f[hardware_info[DEVICE_INFO_PATH]]
                     times = group[DEVICE_TIME][()]
                     static = False
                     if hardware_type == HARDWARE_TYPE_AO:
-                        devices = [(device.name, DEVICE_DATA_AO % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port, 'AO')]
-                    elif hardware_type == HARDWARE_TYPE_STATIC_AO:
-                        devices = [(device.name, DEVICE_DATA_AO % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port, None)]
-                        static = True
-                    elif (hardware_type == HARDWARE_TYPE_DO):
-                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, 'DO')]
-                    elif (hardware_type == HARDWARE_TYPE_STATIC_DO):
-                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, None)]
-                        static = True
-                    elif (hardware_type == HARDWARE_TYPE_TRG):
-                        devices = [(device.name, DEVICE_DATA_DO % (device.hardware_info[DEVICE_INFO_BOARD], device.hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, None)]
+                        devices = [(device.name, DEVICE_DATA_AO % (device.name, hardware_info[DEVICE_INFO_ADDRESS]),device.parent_port, 'AO', None)]
+                        if hardware_subtype == HARDWARE_SUBTYPE_STATIC:
+                            static = True
+                    elif (hardware_type == HARDWARE_TYPE_DO): # note: this includes trigger devices as well
+                        devices = [(device.name, DEVICE_DATA_DO % (hardware_info[DEVICE_INFO_BOARD], hardware_info[DEVICE_INFO_ADDRESS]), device.parent_port, 'DO', None)]
+                        if hardware_subtype == HARDWARE_SUBTYPE_STATIC:
+                            static = True
                     elif hardware_type == HARDWARE_TYPE_DDS:
-                        devices = [(channel.name, DEVICE_DATA_DDS % (device.name, device.hardware_info[DEVICE_INFO_ADDRESS], channel.parent_port), channel.parent_port, None) for channel in device.child_list.values()]
+                        if hardware_subtype == HARDWARE_SUBTYPE_STATIC:
+                            static = True
+                        devices = [(channel.name, DEVICE_DATA_DDS % (device.name, hardware_info[DEVICE_INFO_ADDRESS], channel.parent_port), channel.parent_port, None, DDS_CHANNEL_SCALING[channel.parent_port]) for channel in device.child_list.values()]
                     else:
                         print("warning: device %s unknown type %s (skip)" % (device.name, hardware_type))
                         continue
                     final = {}
-                    for (name, dataset, port, type) in devices:
+                    for (name, dataset, port, type, scaling) in devices:
                         data = group[dataset][()]
                         if data is None:
                             raise LabscriptError("device %s: dataset %s not existing!" % (name, dataset))
@@ -269,8 +285,11 @@ class iPCdev_worker(Worker):
                         elif not static and (len(times) != len(data)):
                             raise LabscriptError("device %s: %i times but %i data!" % (name, len(times), len(data)))
                         if times[-1] > self.exp_time: self.exp_time = times[-1]
-                        channel_data = self.device_class_object.extract_channel_data(device.hardware_info, data)
-                        final[port] = channel_data[-1]
+                        channel_data = self.device_class_object.extract_channel_data(hardware_info, data)
+                        if scaling is not None:
+                            final[port] = channel_data[-1]*scaling
+                        else:
+                            final[port] = channel_data[-1]
                         # save number of used channels per type of port.
                         if (type is not None) and (len(channel_data) > 2):
                             changes = ((channel_data[1:].astype(int) - channel_data[:-1].astype(int)) != 0)
@@ -283,6 +302,8 @@ class iPCdev_worker(Worker):
                     if len(devices) == 1: final_values[connection] = final[device.parent_port]
                     else:                 final_values[connection] = final
 
+                print('final values:', final_values)
+
         if   self.exp_time >= 1.0: tmp = '%.3f s'  % (self.exp_time)
         elif self.exp_time > 1e-3: tmp = '%.3f ms' % (self.exp_time*1e3)
         elif self.exp_time > 1e-6: tmp = '%.3f us' % (self.exp_time*1e6)
@@ -291,14 +312,26 @@ class iPCdev_worker(Worker):
 
         #print('final values:', final_values)
 
-        if True:
+        if self.sync:
             # synchronize boards and get experiment time for all of them
-            # note: this is for demonstration and could be commented.
-            (timeout, board_times, duration) = self.sync_boards(id=EVENT_TRANSITION_TO_BUFFERED, payload=self.exp_time)
-            if timeout:
-                print("\ntimeout sync with all boards!\n")
-                return None
-            print('board times:', board_times)
+            # note: this option is for demonstration and not needed for functionality.
+            #       but some boards, like NI-DAQmx, require synchronization when hardware is shared.
+            #       if a board is restarted we will get timeout but we can restart all boards and try again.
+            count = 0
+            payload = np.round(self.exp_time,6)
+            (timeout, board_times, duration) = self.sync_boards(payload=payload, reset_event_counter=SYNC_RESET_EACH_RUN)
+            while timeout != SYNC_RESULT_OK:
+                if timeout == SYNC_RESULT_TIMEOUT:         tmp = ''
+                elif timeout == SYNC_RESULT_TIMEOUT_OTHER: tmp = '(other) '
+                else:                                      tmp = '(unknown) '
+                if not SYNC_RESET_EACH_RUN and (count < 1):
+                    print("\ntimeout %ssync with all boards! (%.3fms, reset & retry)\n" % (tmp, duration))
+                    (timeout, board_times, duration) = self.sync_boards(payload=payload, reset_event_counter=True)
+                else:
+                    print("\ntimeout %ssync with all boards! (%.3fms, abort)\n" % (tmp, duration))
+                    return None
+                count += 1
+            print('board times (%.3fms):'%duration, board_times)
 
             if True:
                 # we set experiment time to largest of all boards
@@ -329,12 +362,20 @@ class iPCdev_worker(Worker):
             if len(tmp) > 0: print("%s done, active channels: %s (ok)" % (self.device_name, ', '.join(tmp)))
             else:            print("%s done, no active channels (ok)" % (self.device_name))
 
-            # get status (error) of all boards
-            (timeout, self.board_status) = self.sync_boards(EVENT_TRANSITION_TO_MANUAL, payload=error)
-            if timeout:
-                print("\ntimeout get status of all boards!\n")
-                return True
-            print('board status:', self.board_status)
+            if self.sync:
+                # get status (error) of all boards
+                (timeout, self.board_status, duration) = self.sync_boards(payload=error)
+                if timeout == SYNC_RESULT_OK:
+                    print('board status (%.3fms):'%duration, self.board_status)
+                else:
+                    if   timeout == SYNC_RESULT_TIMEOUT:       tmp = ''
+                    elif timeout == SYNC_RESULT_TIMEOUT_OTHER: tmp = '(other) '
+                    else:                                      tmp = '(unknown) '
+                    print("\ntimeout %sget status of all boards! (%.3fms)\n" % (tmp, duration))
+                    return True
+                print('board status (%.3fms):'%duration, self.board_status)
+            else:
+                self.board_status = {self.device_name: error}
 
         # return True = all ok
         return (error == 0)
@@ -404,4 +445,5 @@ class iPCdev_worker(Worker):
         # TODO: cleanup resources here...
         # short sleep to allow user to read that we have cleaned up.
         sleep(0.5)
+        pass
     

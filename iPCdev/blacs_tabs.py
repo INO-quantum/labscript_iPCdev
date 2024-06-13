@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 27/5/2024 by Andi
+# last change 13/5/2024 by Andi
 
 import labscript_utils.h5_lock
 import h5py
@@ -9,6 +9,7 @@ from labscript import LabscriptError, config
 from labscript_utils.qtwidgets.toolpalette import ToolPaletteGroup
 from labscript_utils.qtwidgets.digitaloutput import DigitalOutput
 from labscript_utils.qtwidgets.analogoutput import AnalogOutput
+from labscript_utils.qtwidgets.ddsoutput import DDSOutput
 from blacs.device_base_class import DeviceTab
 from blacs.tab_base_classes import (
     define_state,
@@ -16,7 +17,6 @@ from blacs.tab_base_classes import (
 )
 
 import logging
-from user_devices.iPCdev.labscript_devices import log_level
 from labscript_utils import import_or_reload
 from os.path import split
 
@@ -26,26 +26,46 @@ from os.path import split
 # path to labscript device and worker
 # TODO: in derived class implement init_tab_and_worker with the correct path
 #       and load derived class iPCdev
-from user_devices.iPCdev.labscript_devices import (
-    iPCdev,
+from .labscript_devices import (
+    iPCdev, log_level,
     DEVICE_HARDWARE_INFO, DEVICE_INFO_BOARD, DEVICE_INFO_ADDRESS, DEVICE_INFO_CHANNEL, DEVICE_INFO_TYPE,
-    HARDWARE_TYPE_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_DDS, HARDWARE_TYPE_TRG
+    HARDWARE_TYPE_AO, HARDWARE_TYPE_DO, HARDWARE_TYPE_DDS, HARDWARE_SUBTYPE_STATIC, HARDWARE_SUBTYPE_TRIGGER,
+    HARDWARE_TYPE, HARDWARE_SUBTYPE, DEVICE_INFO_GATE, DEVICE_INFO_GATE_DEVICE, DEVICE_INFO_GATE_CONNECTION,
 )
 worker_path = 'user_devices.iPCdev.blacs_workers.iPCdev_worker'
 
+# channel property names
+PROP_UNIT               = 'base_unit'
+PROP_MIN                = 'min'
+PROP_MAX                = 'max'
+PROP_STEP               = 'step'
+PROP_DEC                = 'decimals'
+
+# analog properties
+PROP_UNIT_V             = 'V'
+PROP_UNIT_A             = 'A'
+
+# DDS channel property names
+PROP_UNIT_MHZ           = 'MHz'
+PROP_UNIT_DBM           = 'dBm'
+PROP_UNIT_DEGREE        = 'deg'     # TODO: use degree symbol (unicode 0x00f0) but I think on Windows does not work?
+DDS_CHANNEL_PROP_FREQ   = 'freq'    # must be the same as DDSQuantity.frequency.connection in labscript.py
+DDS_CHANNEL_PROP_AMP    = 'amp'     # must be the same as DDSQuantity.amplitude.connection in labscript.py
+DDS_CHANNEL_PROP_PHASE  = 'phase'   # must be the same as DDSQuantity.phase.connection in labscript.py
+
 # default channel properties
 # TODO: give for each channel
-default_AO_props = {'base_unit': 'V', 'min': -10.0, 'max': 10.0, 'step': 0.1, 'decimals': 4}
+default_AO_props = {PROP_UNIT: PROP_UNIT_V, PROP_MIN: -10.0, PROP_MAX: 10.0, PROP_STEP: 0.1, PROP_DEC: 4}
 default_DO_props = {}
-default_DDS_props = {'freq' : {'base_unit': 'MHz', 'min': 0.0, 'max': 1000.0, 'step': 1.0, 'decimals': 6},
-                     'amp'  : {'base_unit': 'dBm', 'min': -30.0, 'max': 20.0, 'step': 1.0, 'decimals': 3},
-                     'phase': {'base_unit': 'deg', 'min': -180.0, 'max': 180.0, 'step': 10, 'decimals': 3}
+default_DDS_props = {DDS_CHANNEL_PROP_FREQ  : {PROP_UNIT: PROP_UNIT_MHZ,    PROP_MIN: 0.0,    PROP_MAX: 1000.0, PROP_STEP: 1.0, PROP_DEC: 6},
+                     DDS_CHANNEL_PROP_AMP   : {PROP_UNIT: PROP_UNIT_DBM,    PROP_MIN: -30.0,  PROP_MAX: 20.0,   PROP_STEP: 1.0, PROP_DEC: 3},
+                     DDS_CHANNEL_PROP_PHASE : {PROP_UNIT: PROP_UNIT_DEGREE, PROP_MIN: -180.0, PROP_MAX: 180.0,  PROP_STEP: 10,  PROP_DEC: 3}
                     }
 
 # button name in GUI
-AO_NAME         = 'analog outputs (buffered)'
+AO_NAME         = 'analog outputs'
 AO_NAME_STATIC  = 'analog outputs (static)'
-DO_NAME         = 'digital outputs (buffered): '
+DO_NAME         = 'digital outputs: '
 DO_NAME_STATIC  = 'digital outputs (static): '
 DDS_NAME        = 'DDS channels'
 
@@ -60,14 +80,13 @@ GUI_DO_CLOSE        = False         # if True close DO's on startup
 GUI_DDS_CLOSE       = False         # if True close DDS's on startup
 # other GUI options independent of GUI_ADJUST
 GUI_SHOW_TRIGGER    = False         # if True show trigger devices which are normally hidden.
+# show digital gate in tabs_blacs
+GUI_DDS_SHOW_GATE   = True         # TODO: not tested, just copied from QRF
 
 # worker name given for each board name
 STR_WORKER          = "%s_worker"
 
 class iPCdev_tab(DeviceTab):
-
-    def set_shared_clocklines(self, value):
-        self._shared_clocklines = value
 
     def set_update_time_ms(self, update_time_ms):
         self._update_time_ms = update_time_ms
@@ -84,23 +103,21 @@ class iPCdev_tab(DeviceTab):
         connection_table = self.settings['connection_table']
         self.device = connection_table.find_by_name(self.device_name)
 
-        print('%s: initialize_GUI' % (self.device_name))
+        print('%s initialize_GUI' % (self.device_name))
 
-        if not hasattr(self,'_shared_clocklines'):
-            # option if clocklines are shared between boards (True) or are for each board individually (False, default)
-            # if False (default) displays and saves in self.channels all channels belonging to the clocklines of this board.
-            #       self.clocklines = [] since all clocklines can be obtained from channels.
-            # if True displays and saves in self.channels only channels belonging to this board.
-            #       self.clocklines contains the names of all clocklines of the board.
-            #       this is needed since channels of other boards might use board clockline but no channels of the board.
-            #       for this all boards and clocklines of the system have to be searched.
-            #       implementation:
-            #       the parent_device given in the connection_table is saved in device.hardware_info[DEVICE_INFO_BOARD].
-            #       the clocklines can be given either as part of the connection (usually first entry before '/') or
-            #       are given as arguments to __init__ for the specific derived class. see for example NI_DAQmx_iPCdev.
-            # call self.set_shared_clocklines() from the derived class initialise_GUI before calling super.
-            # note: this affects self.channels and self.clocklines given to worker!
-            self._shared_clocklines = False
+        # option if clocklines are shared between boards (True) or are for each board individually (False, default)
+        # if False (default) displays and saves in self.channels all channels belonging to the clocklines of this board.
+        #       self.clocklines = [] since all clocklines can be obtained from channels.
+        # if True displays and saves in self.channels only channels belonging to this board.
+        #       self.clocklines contains the names of all clocklines of the board.
+        #       this is needed since channels of other boards might use board clockline but no channels of the board.
+        #       for this all boards and clocklines of the system have to be searched.
+        #       implementation:
+        #       the parent_device given in the connection_table is saved in device.hardware_info[DEVICE_INFO_BOARD].
+        #       the clocklines can be given either as part of the connection (usually first entry before '/') or
+        #       are given as arguments to __init__ for the specific derived class. see for example NI_DAQmx_iPCdev.
+        # note: this affects self.channels and self.clocklines given to worker!
+        self.shared_clocklines = self.device.properties['shared_clocklines']
 
         if not hasattr(self,'_update_time_ms'):
             # update time in ms status_monitor is called
@@ -116,7 +133,7 @@ class iPCdev_tab(DeviceTab):
             device_module = import_or_reload(self.derived_module)
             device_class_object = getattr(device_module, self.device.device_class)
 
-        if self._shared_clocklines:
+        if self.shared_clocklines:
             # in order to find all channels we have to search all boards and not only this one.
             primary = self.device
             while primary.parent is not None:
@@ -135,7 +152,7 @@ class iPCdev_tab(DeviceTab):
         # - channels        : key = connection, value = channel device object.
         #                     this is used by get_child_from_connection_table and we give this also to worker.
         # - clocklines      : list of clockline intermediate devices given to worker.
-        #                     used only when _shared_clocklines = True
+        #                     used only when shared_clocklines = True
         # note: connections = pseudo clock -> clockline -> intermediate device -> channel
         # TODO: analog/digital properties should be defined by channel and not from default_AO/DO_props
         ao_prop         = {}
@@ -146,18 +163,21 @@ class iPCdev_tab(DeviceTab):
         while len(boards) > 0:
             board = boards.pop(0)
             this_board = (board.name == self.device_name)
-            #if self._shared_clocklines: print(self.device_name, 'searching for channels of:', board.name)
+            #if self.shared_clocklines: print(self.device_name, 'searching for channels of:', board.name)
             for pseudoclock in board.child_list.values():
                 for clockline in pseudoclock.child_list.values():
                     for IM_name, IM in clockline.child_list.items():
-                        if self._shared_clocklines and this_board:
-                            # save all clocklines. check IM.properties[DEVICE_HARDWARE_INFO] for board and type.
+                        if self.shared_clocklines and this_board:
+                            # save all clocklines belonging to this board.
+                            # check IM.properties[DEVICE_HARDWARE_INFO] for board and type.
                             self.clocklines.append(IM)
                         for channel_name, channel in IM.child_list.items():
                             #print(channel_name, channel.device_class, child.properties)
                             hardware_info = channel.properties[DEVICE_HARDWARE_INFO]
-                            if channel.device_class == "Trigger":
-                                if self._shared_clocklines:
+                            type = hardware_info[DEVICE_INFO_TYPE][HARDWARE_TYPE]
+                            subtype = hardware_info[DEVICE_INFO_TYPE][HARDWARE_SUBTYPE]
+                            if subtype == HARDWARE_SUBTYPE_TRIGGER:
+                                if self.shared_clocklines:
                                     if len(channel.child_list) != 1:
                                         raise LabscriptError("%s trigger %s has %i boards attached but should be 1! this is a bug." % (self.device_name, channel.name, len(channel.child_list)))
                                     # save next board into list of boards
@@ -171,21 +191,21 @@ class iPCdev_tab(DeviceTab):
                                     props.update(channel.properties)
                                     do_prop[0][channel.parent_port] = props
                             else:
-                                if self._shared_clocklines and \
+                                if self.shared_clocklines and \
                                    hardware_info[DEVICE_INFO_BOARD] != self.device_name:
                                     # skip devices not belonging to this board
                                     #print(self.device_name, 'skipping', channel_name, 'belonging to', channel.hardware_info[DEVICE_INFO_BOARD])
                                     continue
-                                if (channel.device_class == 'AnalogOut') or (channel.device_class == 'StaticAnalogOut'):
+                                if type == HARDWARE_TYPE_AO:
                                     props = default_AO_props.copy()
                                     props.update(channel.properties)
                                     ao_prop[channel.parent_port] = props
-                                elif (channel.device_class == 'DigitalOut') or (channel.device_class == 'StaticDigitalOut'):
+                                elif type == HARDWARE_TYPE_DO:
                                     props = default_DO_props.copy()
                                     props.update(channel.properties)
                                     do_prop[channel.parent_port] = props
-                                elif channel.device_class == 'DDS':
-                                    #print('DDS', channel.name, 'connection', channel.parent_port)
+                                elif type == HARDWARE_TYPE_DDS:
+                                    #print('DDS', channel.name, 'connection', channel.parent_port, 'properties', channel.properties)
                                     props = default_DDS_props
                                     props.update(channel.properties)
                                     dds_prop[channel.parent_port] = props
@@ -193,7 +213,7 @@ class iPCdev_tab(DeviceTab):
                                     raise LabscriptError('channel %s class %s not implemented!' % (channel.name, channel.device_class))
                             # save hardware info into channel
                             # TODO: not really needed, this way information is twice!?
-                            channel.hardware_info = hardware_info
+                            #channel.hardware_info = hardware_info
                             # save channel for each connection = parent_port
                             self.channels[channel.parent_port] = channel
 
@@ -355,7 +375,21 @@ class iPCdev_tab(DeviceTab):
                             do.setStyleSheet('QPushButton {color: white;}')
                             #do.setFixedWidth(100)
                             #do.setMinimumWidth(100)
-                    #AO = widget.findChildren(AnalogOutput)
+                    if GUI_DDS_SHOW_GATE:
+                        dds_list = widget.findChildren(DDSOutput)
+                        for dds in dds_list:
+                            connection = dds._hardware_name # connection = 'channel %i'
+                            device = self.channels[connection]
+                            hardware_info = device.properties[DEVICE_HARDWARE_INFO]
+                            try:
+                                gate = hardware_info[DEVICE_INFO_GATE]
+                            except KeyError:
+                                continue
+                            label = dds._label.text().split('\n')  # [connection, user given name]
+                            label.append("%s: %s" % (gate[DEVICE_INFO_GATE_DEVICE], gate[DEVICE_INFO_GATE_CONNECTION]))
+                            label = '\n'.join(label)
+                            dds._label.setText(label)
+                #AO = widget.findChildren(AnalogOutput)
                     #for ao in AO:
                     #    #ao.setFixedWidth(100)
                     #    ao.setMinimumWidth(100)
@@ -370,14 +404,14 @@ class iPCdev_tab(DeviceTab):
         #self._ui.update()
 
         # perform further initalization and create worker in derived class
-        # note: properties contains 'worker_args'. del does not work?
+        # note: properties contains 'worker_args' and 'shared_clocklines'. del does not work?
         self.worker_args = {'is_primary'        : self.device.properties['is_primary'],
                             'boards'            : self.device.properties['boards'],
                             'channels'          : self.channels,
-                            'clocklines'        : self.clocklines,
-                            'shared_clocklines' : self._shared_clocklines,
                             'properties'        : self.device.properties,
                             'device_class'      : self.device.device_class}
+        if self.shared_clocklines:
+            self.worker_args.update({'clocklines': self.clocklines})
         self.primary_worker = STR_WORKER % (self.device_name)
         self.init_tab_and_worker()
 
@@ -401,7 +435,7 @@ class iPCdev_tab(DeviceTab):
 
         # Set the capabilities of this device
         self.supports_remote_value_check(False)
-        self.supports_smart_programming(False)
+        self.supports_smart_programming(True)
 
     def get_child_from_connection_table(self, parent_device_name, port):
         # this is called from create_analog_outputs or create_digital_outputs to get the name of the channel.
@@ -482,7 +516,8 @@ class iPCdev_tab(DeviceTab):
         # optionally return empty dict when transition_to_manual is called with abort=True.
         # TODO: save result into h5 file either here or in primary worker.
         board_status = yield(self.queue_work(self.primary_worker, 'status_monitor', True))
-        #print(self.device_name, 'status end result', board_status)
+        if False:
+            print(self.device_name, 'status end result', board_status)
 
     def get_save_data(self):
         "return all GUI settings to be retrieved after BLACS restarts"
