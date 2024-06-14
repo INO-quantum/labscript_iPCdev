@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 13/6/2024 by Andi
+# last change 14/6/2024 by Andi
 
 # TODO: when needed implement split_connection, combine_channel_data, extract_channel_data and generate_code for your device.
 
@@ -267,7 +267,7 @@ class iPCdev(PseudoclockDevice):
         # save shared_clocklines into connection_table
         self.set_property('shared_clocklines', iPCdev.shared_clocklines , location='connection_table_properties')
 
-    def add_device(self, device):
+    def add_device(self, device, allow_create_new=True):
         if isinstance(device, Pseudoclock):
             # pseudoclock connected
             #print('adding pseudoclock', device.name)
@@ -282,9 +282,14 @@ class iPCdev(PseudoclockDevice):
             # 2. save original parent_device name into hardware_info in case clockline is not of the same device
             #    blacs_tabs uses this to get board devices only for diaplaying and to give to worker
             device.hardware_info.update({DEVICE_INFO_BOARD:self.name})
-            #print(self.name, 'split_connection (iPCdev):', device.name, 'clockline', clockline_name, 'hw info', device.hardware_info)
+            #print(self.name, 'split_connection (iPCdev):', device.name, 'clockline', clockline_name, 'hw info', device.hardware_info, 'shared clocklines', iPCdev.shared_clocklines)
             # 3. find or create intermediate device
-            device.parent_device = self.get_device(clockline_name, True)
+            device.parent_device = self.get_device(clockline_name, allow_create_new=allow_create_new)
+            if device.parent_device is None:
+                if allow_create_new:
+                    raise LabscriptError("%s error adding '%s', type '%s': clockline '%s' could not be created!" % (self.name, device.name, type(device).__name__, clockline_name))
+                else:
+                    raise LabscriptError("%s error adding '%s', type '%s': could not find clockline '%s'!" % (self.name, device.name, type(device).__name__, clockline_name))
             #print('add_device IM device', device.parent_device.name)
             # 4. save device hardware information into connection table
             device.set_property(DEVICE_HARDWARE_INFO, device.hardware_info, location='connection_table_properties')
@@ -296,7 +301,7 @@ class iPCdev(PseudoclockDevice):
         returns intermediate (IM) device for given clockline_name.
         either creates new pseudoclock + clockline + IM device or returns existing IM device.
         searchs IM device names in primary device list.
-        if allow_create_new = False the device must exist, otherwise returns None
+        if allow_create_new = False the device must exist, otherwise returns None.
         if allow_create_new = True creates and returns new device if does not exists.
         notes:
         in default implementation the name is related to iPCdev device, so the IM device belongs to this board.
@@ -325,6 +330,7 @@ class iPCdev(PseudoclockDevice):
             else:                    devices += self.primary.child_devices
         else:
             devices += self.child_devices
+        #print('searching board:', self.name if self.primary is None else self.primary.name)
         while len(devices) > 0:
             ps = devices.pop(0)
             for cl in ps.child_devices:
@@ -336,9 +342,11 @@ class iPCdev(PseudoclockDevice):
                     if iPCdev.shared_clocklines:
                         for child in im.child_devices:
                             if isinstance(child, Trigger):
-                                if len(child.child_list) != 1:
-                                    raise LabscriptError("%s trigger %s has %i boards attached but should be 1! this is a bug." % (self.name, child.name, len(child.child_list)))
-                                devices.append(next(iter(child.child_devices)))
+                                if len(child.child_devices) != 1:
+                                    raise LabscriptError("%s trigger %s has %i boards attached but should be 1! this is a bug." % (self.name, child.name, len(child.child_devices)))
+                                board = next(iter(child.child_devices))
+                                #print('searching board:', board.name)
+                                devices += board.child_devices
 
         #print('IM device not found for', name_dev)
 
@@ -670,7 +678,7 @@ class iPCdev(PseudoclockDevice):
                     # device path
                     path = DEVICE_DEVICES + DEVICE_SEP + self.name + DEVICE_SEP + IM.name
                     if IM.hardware_type is None:
-                        # IM device created but has no channels?
+                        # IM device created but has no channels? should not happen except for virtual trigger without sec. boards.
                         print('warning: skip device %s without channels.' % (IM.name))
                     else:
                         addr_type = IM.hardware_type[HARDWARE_ADDRTYPE]

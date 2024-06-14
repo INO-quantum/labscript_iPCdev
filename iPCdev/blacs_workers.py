@@ -1,6 +1,6 @@
 # internal pseudoclock device
 # created April 2024 by Andi
-# last change 13/6/2024 by Andi
+# last change 14/6/2024 by Andi
 
 import numpy as np
 import labscript_utils.h5_lock
@@ -38,7 +38,12 @@ UPDATE_TIME                     = 1.0
 # default timeout in seconds for sync_boards
 SYNC_TIMEOUT                    = 1.0
 
-# reset sync counter each run. TODO: not fully tested.
+# if True reset sync counter each run.
+# TODO: False case is tested quite a lot and seems to work (although maybe in very rare cases could still cause timeout).
+#       True case is not much tested. this was original approach but did not worked due to subtle timing problems.
+#       these problems were debugged and hopefully all fixed and now also this case should work again.
+#       the problems mainly occur when restarting boards, after compilation or start of blacs, but only in rare cases.
+#       so its not so easy to detect if it is working now or not.
 SYNC_RESET_EACH_RUN             = True
 
 # time margin for sync_boards with reset_event_counter=True
@@ -60,6 +65,11 @@ SYNC_RESULT_TIMEOUT_OTHER       = 2     # timeout on another board
 DDS_CHANNEL_SCALING = {DDS_CHANNEL_PROP_FREQ: 1e-6, DDS_CHANNEL_PROP_AMP: 1.0, DDS_CHANNEL_PROP_PHASE: 1.0}
 
 class iPCdev_worker(Worker):
+
+    # synchronization options. overwrite in derived class
+    sync_reset_each_run = SYNC_RESET_EACH_RUN
+    sync_time_margin    = SYNC_TIME_MARGIN
+
     def init(self):
         global zTimeoutError; from zprocess.utils import TimeoutError as zTimeoutError
         global get_ticks; from time import perf_counter as get_ticks
@@ -175,9 +185,9 @@ class iPCdev_worker(Worker):
         sync_result = SYNC_RESULT_OK
         if self.is_primary:
             # 1. primary board: first wait then send
-            if not SYNC_RESET_EACH_RUN and reset_event_counter:
+            if not iPCdev_worker.sync_reset_each_run and reset_event_counter:
                 # compensate the additional waiting time of secondary boards
-                timeout += SYNC_TIME_MARGIN
+                timeout += iPCdev_worker.sync_time_margin
             result = {} if payload is None else {self.device_name:payload}
             event = self.events_wait[0]
             #sleep(0.1) # this triggers 100% the timeout event! when restarting both secondary boards!
@@ -207,9 +217,9 @@ class iPCdev_worker(Worker):
             duration = (get_ticks() - t_start) * 1e3
         else:
             # 2. secondary board: first send then wait
-            if not SYNC_RESET_EACH_RUN and reset_event_counter:
+            if not iPCdev_worker.sync_reset_each_run and reset_event_counter:
                 # ensure primary is reset before sending the reset event id
-                sleep(SYNC_TIME_MARGIN)
+                sleep(iPCdev_worker.sync_time_margin)
             self.events_post[0].post(self.event_count, data={self.device_name:payload})
             is_timeout = False
             try:
@@ -324,7 +334,7 @@ class iPCdev_worker(Worker):
                 if timeout == SYNC_RESULT_TIMEOUT:         tmp = ''
                 elif timeout == SYNC_RESULT_TIMEOUT_OTHER: tmp = '(other) '
                 else:                                      tmp = '(unknown) '
-                if not SYNC_RESET_EACH_RUN and (count < 1):
+                if not iPCdev_worker.sync_reset_each_run and (count < 1):
                     print("\ntimeout %ssync with all boards! (%.3fms, reset & retry)\n" % (tmp, duration))
                     (timeout, board_times, duration) = self.sync_boards(payload=payload, reset_event_counter=True)
                 else:
